@@ -39,6 +39,9 @@ use crate::realtime_conversation::handle_audio as handle_realtime_conversation_a
 use crate::realtime_conversation::handle_close as handle_realtime_conversation_close;
 use crate::realtime_conversation::handle_start as handle_realtime_conversation_start;
 use crate::realtime_conversation::handle_text as handle_realtime_conversation_text;
+use crate::remote_workspace::BindRemoteWorkspaceRequest;
+use crate::remote_workspace::RemoteWorkspaceClient;
+use crate::remote_workspace::RemoteWorkspaceSession;
 use crate::rollout::session_index;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::handle_non_tool_response_item;
@@ -281,6 +284,7 @@ use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::events::get_turn_unified_diff;
 use crate::tools::handlers::SEARCH_TOOL_BM25_TOOL_NAME;
 use crate::tools::js_repl::JsReplHandle;
 use crate::tools::js_repl::resolve_compatible_node;
@@ -500,6 +504,10 @@ impl Codex {
             file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
             network_sandbox_policy: config.permissions.network_sandbox_policy,
             windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+            remote_workspace: config
+                .remote_workspace
+                .clone()
+                .map(RemoteWorkspaceSession::new),
             cwd: config.cwd.clone(),
             codex_home: config.codex_home.clone(),
             thread_name: None,
@@ -696,6 +704,7 @@ pub(crate) struct TurnContext {
     pub(crate) sandbox_policy: Constrained<SandboxPolicy>,
     pub(crate) file_system_sandbox_policy: FileSystemSandboxPolicy,
     pub(crate) network_sandbox_policy: NetworkSandboxPolicy,
+    pub(crate) remote_workspace: Option<RemoteWorkspaceSession>,
     pub(crate) network: Option<NetworkProxy>,
     pub(crate) windows_sandbox_level: WindowsSandboxLevel,
     pub(crate) shell_environment_policy: ShellEnvironmentPolicy,
@@ -757,6 +766,7 @@ impl TurnContext {
             web_search_mode: self.tools_config.web_search_mode,
             session_source: self.session_source.clone(),
         })
+        .with_remote_workspace_enabled(self.remote_workspace.is_some())
         .with_web_search_config(self.tools_config.web_search_config.clone())
         .with_allow_login_shell(self.tools_config.allow_login_shell)
         .with_agent_roles(config.agent_roles.clone());
@@ -789,6 +799,7 @@ impl TurnContext {
             sandbox_policy: self.sandbox_policy.clone(),
             file_system_sandbox_policy: self.file_system_sandbox_policy.clone(),
             network_sandbox_policy: self.network_sandbox_policy,
+            remote_workspace: self.remote_workspace.clone(),
             network: self.network.clone(),
             windows_sandbox_level: self.windows_sandbox_level,
             shell_environment_policy: self.shell_environment_policy.clone(),
@@ -897,6 +908,7 @@ pub(crate) struct SessionConfiguration {
     file_system_sandbox_policy: FileSystemSandboxPolicy,
     network_sandbox_policy: NetworkSandboxPolicy,
     windows_sandbox_level: WindowsSandboxLevel,
+    remote_workspace: Option<RemoteWorkspaceSession>,
 
     /// Working directory that should be treated as the *root* of the
     /// session. All relative paths supplied by the model as well as the
@@ -1080,6 +1092,30 @@ impl Session {
         per_turn_config
     }
 
+    async fn initialize_remote_workspace(
+        conversation_id: ThreadId,
+        session_configuration: &mut SessionConfiguration,
+    ) -> anyhow::Result<Option<Arc<RemoteWorkspaceClient>>> {
+        let Some(remote_workspace) = session_configuration.remote_workspace.as_mut() else {
+            return Ok(None);
+        };
+        let Some(client) = RemoteWorkspaceClient::from_config(&remote_workspace.config)? else {
+            return Ok(None);
+        };
+
+        let binding = client
+            .bind_session(BindRemoteWorkspaceRequest {
+                session_id: conversation_id.to_string(),
+                cwd: session_configuration.cwd.clone(),
+                template: remote_workspace.config.template.clone(),
+                import_mode: remote_workspace.config.import_mode,
+                export_mode: remote_workspace.config.export_mode,
+            })
+            .await?;
+        remote_workspace.workspace_id = Some(binding.workspace_id);
+        Ok(Some(Arc::new(client)))
+    }
+
     pub(crate) async fn codex_home(&self) -> PathBuf {
         let state = self.state.lock().await;
         state.session_configuration.codex_home().clone()
@@ -1141,6 +1177,7 @@ impl Session {
             web_search_mode: Some(per_turn_config.web_search_mode.value()),
             session_source: session_source.clone(),
         })
+        .with_remote_workspace_enabled(session_configuration.remote_workspace.is_some())
         .with_web_search_config(per_turn_config.web_search_config.clone())
         .with_allow_login_shell(per_turn_config.permissions.allow_login_shell)
         .with_agent_roles(per_turn_config.agent_roles.clone());
@@ -1181,6 +1218,7 @@ impl Session {
             sandbox_policy: session_configuration.sandbox_policy.clone(),
             file_system_sandbox_policy: session_configuration.file_system_sandbox_policy.clone(),
             network_sandbox_policy: session_configuration.network_sandbox_policy,
+            remote_workspace: session_configuration.remote_workspace.clone(),
             network,
             windows_sandbox_level: session_configuration.windows_sandbox_level,
             shell_environment_policy: per_turn_config.permissions.shell_environment_policy.clone(),
@@ -1481,6 +1519,8 @@ impl Session {
                 }
             };
         session_configuration.thread_name = thread_name.clone();
+        let remote_workspace_client =
+            Self::initialize_remote_workspace(conversation_id, &mut session_configuration).await?;
         let state = SessionState::new(session_configuration.clone());
         let managed_network_requirements_enabled = config.managed_network_requirements_enabled();
         let network_approval = Arc::new(NetworkApprovalService::default());
@@ -1570,6 +1610,8 @@ impl Session {
             network_proxy,
             network_approval: Arc::clone(&network_approval),
             state_db: state_db_ctx.clone(),
+            remote_workspace_client,
+            remote_unified_exec_sessions: Mutex::new(HashMap::new()),
             model_client: ModelClient::new(
                 Some(Arc::clone(&auth_manager)),
                 conversation_id,
@@ -4937,6 +4979,7 @@ async fn spawn_review_thread(
         web_search_mode: Some(review_web_search_mode),
         session_source: parent_turn_context.session_source.clone(),
     })
+    .with_remote_workspace_enabled(parent_turn_context.remote_workspace.is_some())
     .with_web_search_config(None)
     .with_allow_login_shell(config.permissions.allow_login_shell)
     .with_agent_roles(config.agent_roles.clone());
@@ -5012,6 +5055,7 @@ async fn spawn_review_thread(
         sandbox_policy: parent_turn_context.sandbox_policy.clone(),
         file_system_sandbox_policy: parent_turn_context.file_system_sandbox_policy.clone(),
         network_sandbox_policy: parent_turn_context.network_sandbox_policy,
+        remote_workspace: parent_turn_context.remote_workspace.clone(),
         network: parent_turn_context.network.clone(),
         windows_sandbox_level: parent_turn_context.windows_sandbox_level,
         shell_environment_policy: parent_turn_context.shell_environment_policy.clone(),
@@ -6860,11 +6904,9 @@ async fn try_run_sampling_request(
     drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
 
     if should_emit_turn_diff {
-        let unified_diff = {
-            let mut tracker = turn_diff_tracker.lock().await;
-            tracker.get_unified_diff()
-        };
-        if let Ok(Some(unified_diff)) = unified_diff {
+        if let Some(unified_diff) =
+            get_turn_unified_diff(&sess, &turn_context, Some(&turn_diff_tracker)).await
+        {
             let msg = EventMsg::TurnDiff(TurnDiffEvent { unified_diff });
             sess.clone().send_event(&turn_context, msg).await;
         }

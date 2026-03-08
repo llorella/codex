@@ -11,6 +11,8 @@ use crate::exec::ExecToolCallOutput;
 use crate::function_tool::FunctionCallError;
 use crate::mcp_connection_manager::ToolInfo;
 use crate::models_manager::model_info;
+use crate::remote_workspace::RemoteWorkspaceConfig;
+use crate::remote_workspace::RemoteWorkspaceSession;
 use crate::shell::default_user_shell;
 use crate::tools::format_exec_output_str;
 
@@ -1422,6 +1424,10 @@ async fn set_rate_limits_retains_previous_credits() {
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+        remote_workspace: config
+            .remote_workspace
+            .clone()
+            .map(RemoteWorkspaceSession::new),
         cwd: config.cwd.clone(),
         codex_home: config.codex_home.clone(),
         thread_name: None,
@@ -1518,6 +1524,10 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+        remote_workspace: config
+            .remote_workspace
+            .clone()
+            .map(RemoteWorkspaceSession::new),
         cwd: config.cwd.clone(),
         codex_home: config.codex_home.clone(),
         thread_name: None,
@@ -1872,6 +1882,10 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+        remote_workspace: config
+            .remote_workspace
+            .clone()
+            .map(RemoteWorkspaceSession::new),
         cwd: config.cwd.clone(),
         codex_home: config.codex_home.clone(),
         thread_name: None,
@@ -1931,6 +1945,10 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+        remote_workspace: config
+            .remote_workspace
+            .clone()
+            .map(RemoteWorkspaceSession::new),
         cwd: config.cwd.clone(),
         codex_home: config.codex_home.clone(),
         thread_name: None,
@@ -1975,6 +1993,127 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
     };
     let msg = format!("{err:#}");
     assert!(msg.contains("zsh fork feature enabled, but `zsh_path` is not configured"));
+}
+
+#[tokio::test]
+async fn session_new_binds_remote_workspace_when_enabled() -> anyhow::Result<()> {
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/workspaces/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "workspace_id": "ws_test_session"
+        })))
+        .mount(&server)
+        .await;
+
+    let codex_home = tempfile::tempdir().expect("create temp dir");
+    let mut config = build_test_config(codex_home.path()).await;
+    config.remote_workspace = Some(RemoteWorkspaceConfig {
+        enabled: true,
+        base_url: Some(server.uri()),
+        ..Default::default()
+    });
+    let config = Arc::new(config);
+
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let models_manager = Arc::new(ModelsManager::new(
+        config.codex_home.clone(),
+        auth_manager.clone(),
+        None,
+        CollaborationModesConfig::default(),
+    ));
+    let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
+    let model_info = ModelsManager::construct_model_info_offline_for_tests(model.as_str(), &config);
+    let collaboration_mode = CollaborationMode {
+        mode: ModeKind::Default,
+        settings: Settings {
+            model,
+            reasoning_effort: config.model_reasoning_effort,
+            developer_instructions: None,
+        },
+    };
+    let session_configuration = SessionConfiguration {
+        provider: config.model_provider.clone(),
+        collaboration_mode,
+        model_reasoning_summary: config.model_reasoning_summary,
+        developer_instructions: config.developer_instructions.clone(),
+        user_instructions: config.user_instructions.clone(),
+        service_tier: None,
+        personality: config.personality,
+        base_instructions: config
+            .base_instructions
+            .clone()
+            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+        compact_prompt: config.compact_prompt.clone(),
+        approval_policy: config.permissions.approval_policy.clone(),
+        sandbox_policy: config.permissions.sandbox_policy.clone(),
+        file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
+        network_sandbox_policy: config.permissions.network_sandbox_policy,
+        windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+        remote_workspace: config
+            .remote_workspace
+            .clone()
+            .map(RemoteWorkspaceSession::new),
+        cwd: config.cwd.clone(),
+        codex_home: config.codex_home.clone(),
+        thread_name: None,
+        original_config_do_not_use: Arc::clone(&config),
+        metrics_service_name: None,
+        app_server_client_name: None,
+        session_source: SessionSource::Exec,
+        dynamic_tools: Vec::new(),
+        persist_extended_history: false,
+        inherited_shell_snapshot: None,
+    };
+
+    let (tx_event, _rx_event) = async_channel::unbounded();
+    let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
+    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.clone()));
+    let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
+    let skills_manager = Arc::new(SkillsManager::new(
+        config.codex_home.clone(),
+        Arc::clone(&plugins_manager),
+    ));
+
+    let session = Session::new(
+        session_configuration,
+        Arc::clone(&config),
+        auth_manager,
+        models_manager,
+        ExecPolicyManager::default(),
+        tx_event,
+        agent_status_tx,
+        InitialHistory::New,
+        SessionSource::Exec,
+        skills_manager,
+        plugins_manager,
+        mcp_manager,
+        Arc::new(FileWatcher::noop()),
+        AgentControl::default(),
+    )
+    .await?;
+
+    let state = session.state.lock().await;
+    let remote_workspace = state
+        .session_configuration
+        .remote_workspace
+        .as_ref()
+        .expect("remote workspace should be bound");
+    assert_eq!(
+        remote_workspace.workspace_id.as_deref(),
+        Some("ws_test_session")
+    );
+    drop(state);
+
+    assert!(session.services.remote_workspace_client.is_some());
+
+    Ok(())
 }
 
 // todo: use online model info
@@ -2023,6 +2162,10 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+        remote_workspace: config
+            .remote_workspace
+            .clone()
+            .map(RemoteWorkspaceSession::new),
         cwd: config.cwd.clone(),
         codex_home: config.codex_home.clone(),
         thread_name: None,
@@ -2093,6 +2236,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         network_proxy: None,
         network_approval: Arc::clone(&network_approval),
         state_db: None,
+        remote_workspace_client: None,
+        remote_unified_exec_sessions: Mutex::new(HashMap::new()),
         model_client: ModelClient::new(
             Some(auth_manager.clone()),
             conversation_id,
@@ -2430,6 +2575,10 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+        remote_workspace: config
+            .remote_workspace
+            .clone()
+            .map(RemoteWorkspaceSession::new),
         cwd: config.cwd.clone(),
         codex_home: config.codex_home.clone(),
         thread_name: None,
@@ -2500,6 +2649,8 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         network_proxy: None,
         network_approval: Arc::clone(&network_approval),
         state_db: None,
+        remote_workspace_client: None,
+        remote_unified_exec_sessions: Mutex::new(HashMap::new()),
         model_client: ModelClient::new(
             Some(Arc::clone(&auth_manager)),
             conversation_id,

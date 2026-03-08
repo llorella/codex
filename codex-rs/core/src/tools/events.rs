@@ -15,6 +15,7 @@ use crate::protocol::PatchApplyBeginEvent;
 use crate::protocol::PatchApplyEndEvent;
 use crate::protocol::PatchApplyStatus;
 use crate::protocol::TurnDiffEvent;
+use crate::remote_workspace::RemoteExportPatchRequest;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::sandboxing::ToolError;
 use codex_protocol::parse_command::ParsedCommand;
@@ -22,6 +23,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
+use tracing::warn;
 
 use super::format_exec_output_str;
 
@@ -511,15 +513,98 @@ async fn emit_patch_end(
         )
         .await;
 
-    if let Some(tracker) = ctx.turn_diff_tracker {
+    if let Some(unified_diff) =
+        get_turn_unified_diff(ctx.session, ctx.turn, ctx.turn_diff_tracker).await
+    {
+        ctx.session
+            .send_event(ctx.turn, EventMsg::TurnDiff(TurnDiffEvent { unified_diff }))
+            .await;
+    }
+}
+
+pub(crate) async fn get_turn_unified_diff(
+    session: &Session,
+    turn: &TurnContext,
+    turn_diff_tracker: Option<&SharedTurnDiffTracker>,
+) -> Option<String> {
+    if let Some(remote_workspace) = turn.remote_workspace.as_ref()
+        && let Some(workspace_id) = remote_workspace.workspace_id.as_ref()
+        && let Some(client) = session.services.remote_workspace_client.as_ref()
+    {
+        match client
+            .export_patch(RemoteExportPatchRequest {
+                workspace_id: workspace_id.clone(),
+            })
+            .await
+        {
+            Ok(response) => return response.unified_diff,
+            Err(err) => {
+                warn!("failed to export remote workspace patch for turn diff: {err}");
+                return None;
+            }
+        }
+    }
+
+    if let Some(tracker) = turn_diff_tracker {
         let unified_diff = {
             let mut guard = tracker.lock().await;
             guard.get_unified_diff()
         };
-        if let Ok(Some(unified_diff)) = unified_diff {
-            ctx.session
-                .send_event(ctx.turn, EventMsg::TurnDiff(TurnDiffEvent { unified_diff }))
-                .await;
+        match unified_diff {
+            Ok(diff) => return diff,
+            Err(err) => warn!("failed to compute local turn diff: {err}"),
         }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codex::make_session_and_context;
+    use crate::remote_workspace::RemoteWorkspaceClient;
+    use crate::remote_workspace::RemoteWorkspaceConfig;
+    use crate::remote_workspace::RemoteWorkspaceSession;
+    use crate::turn_diff_tracker::TurnDiffTracker;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn get_turn_unified_diff_uses_remote_workspace_when_bound() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/workspaces/ws_turn/export_patch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "unified_diff": "diff --git a/src/lib.rs b/src/lib.rs\n"
+            })))
+            .mount(&server)
+            .await;
+
+        let (mut session, mut turn) = make_session_and_context().await;
+        let config = RemoteWorkspaceConfig {
+            enabled: true,
+            base_url: Some(server.uri()),
+            ..Default::default()
+        };
+        session.services.remote_workspace_client = Some(Arc::new(
+            RemoteWorkspaceClient::from_config(&config)?.expect("client"),
+        ));
+        turn.remote_workspace = Some(RemoteWorkspaceSession {
+            config,
+            workspace_id: Some("ws_turn".to_string()),
+        });
+
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        let unified_diff = get_turn_unified_diff(&session, &turn, Some(&tracker)).await;
+
+        assert_eq!(
+            unified_diff,
+            Some("diff --git a/src/lib.rs b/src/lib.rs\n".to_string())
+        );
+        Ok(())
     }
 }

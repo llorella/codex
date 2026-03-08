@@ -1329,6 +1329,66 @@
       ],
       "type": "object"
     },
+    "RemoteWorkspaceConfig": {
+      "additionalProperties": false,
+      "description": "Configuration for a remote-authoritative coding workspace.",
+      "properties": {
+        "auth_token_env_var": {
+          "description": "Optional environment variable name containing a bearer token.",
+          "type": "string"
+        },
+        "base_url": {
+          "description": "Base URL for the remote workspace control plane.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Enables remote-authoritative workspace mode for the session.",
+          "type": "boolean"
+        },
+        "export_mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RemoteWorkspaceExportMode"
+            }
+          ],
+          "default": "patch",
+          "description": "How remote changes should be exported back to the caller."
+        },
+        "import_mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RemoteWorkspaceImportMode"
+            }
+          ],
+          "default": "copy",
+          "description": "How the local repo should be imported into the remote workspace."
+        },
+        "provider": {
+          "description": "Optional provider/backend identifier used by the remote workspace API.",
+          "type": "string"
+        },
+        "template": {
+          "description": "Optional template or image identifier used to provision the workspace.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RemoteWorkspaceExportMode": {
+      "enum": [
+        "patch",
+        "branch"
+      ],
+      "type": "string"
+    },
+    "RemoteWorkspaceImportMode": {
+      "enum": [
+        "copy",
+        "git_clone"
+      ],
+      "type": "string"
+    },
     "SandboxMode": {
       "enum": [
         "read-only",
@@ -2213,6 +2273,14 @@
         "$ref": "#/definitions/ProjectConfig"
       },
       "type": "object"
+    },
+    "remote_workspace": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RemoteWorkspaceConfig"
+        }
+      ],
+      "description": "Optional configuration for using a remote-authoritative workspace."
     },
     "review_model": {
       "description": "Review model override used by the `/review` feature.",

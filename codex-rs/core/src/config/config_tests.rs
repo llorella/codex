@@ -11,6 +11,7 @@ use crate::config::types::NotificationMethod;
 use crate::config::types::Notifications;
 use crate::config_loader::RequirementSource;
 use crate::features::Feature;
+use crate::remote_workspace::RemoteWorkspaceConfig;
 use assert_matches::assert_matches;
 use codex_config::CONFIG_TOML_FILE;
 use codex_protocol::permissions::FileSystemAccessMode;
@@ -153,6 +154,48 @@ consolidation_model = "gpt-5"
             consolidation_model: Some("gpt-5".to_string()),
         }
     );
+}
+
+#[test]
+fn remote_workspace_config_is_only_enabled_when_requested() {
+    let codex_home = tempdir().expect("create tempdir");
+    let enabled_config = Config::load_from_base_config_with_overrides(
+        ConfigToml {
+            remote_workspace: Some(RemoteWorkspaceConfig {
+                enabled: true,
+                base_url: Some("https://sandbox.example.test".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )
+    .expect("load config with enabled remote workspace");
+    assert_eq!(
+        enabled_config.remote_workspace,
+        Some(RemoteWorkspaceConfig {
+            enabled: true,
+            base_url: Some("https://sandbox.example.test".to_string()),
+            ..Default::default()
+        })
+    );
+
+    let codex_home = tempdir().expect("create tempdir");
+    let disabled_config = Config::load_from_base_config_with_overrides(
+        ConfigToml {
+            remote_workspace: Some(RemoteWorkspaceConfig {
+                enabled: false,
+                base_url: Some("https://sandbox.example.test".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )
+    .expect("load config with disabled remote workspace");
+    assert_eq!(disabled_config.remote_workspace, None);
 }
 
 #[test]
@@ -3022,6 +3065,7 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             user_instructions: None,
             notify: None,
             cwd: fixture.cwd(),
+            remote_workspace: None,
             cli_auth_credentials_store_mode: Default::default(),
             mcp_servers: Constrained::allow_any(HashMap::new()),
             mcp_oauth_credentials_store_mode: Default::default(),
@@ -3157,6 +3201,7 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         user_instructions: None,
         notify: None,
         cwd: fixture.cwd(),
+        remote_workspace: None,
         cli_auth_credentials_store_mode: Default::default(),
         mcp_servers: Constrained::allow_any(HashMap::new()),
         mcp_oauth_credentials_store_mode: Default::default(),
@@ -3290,6 +3335,7 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         user_instructions: None,
         notify: None,
         cwd: fixture.cwd(),
+        remote_workspace: None,
         cli_auth_credentials_store_mode: Default::default(),
         mcp_servers: Constrained::allow_any(HashMap::new()),
         mcp_oauth_credentials_store_mode: Default::default(),
@@ -3409,6 +3455,7 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         user_instructions: None,
         notify: None,
         cwd: fixture.cwd(),
+        remote_workspace: None,
         cli_auth_credentials_store_mode: Default::default(),
         mcp_servers: Constrained::allow_any(HashMap::new()),
         mcp_oauth_credentials_store_mode: Default::default(),

@@ -8,6 +8,8 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::function_tool::FunctionCallError;
+use crate::remote_workspace::RemoteGrepFilesRequest;
+use crate::remote_workspace::RemoteWorkspaceClient;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -43,7 +45,12 @@ impl ToolHandler for GrepFilesHandler {
     }
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
-        let ToolInvocation { payload, turn, .. } = invocation;
+        let ToolInvocation {
+            payload,
+            turn,
+            session,
+            ..
+        } = invocation;
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -72,8 +79,6 @@ impl ToolHandler for GrepFilesHandler {
         let limit = args.limit.min(MAX_LIMIT);
         let search_path = turn.resolve_path(args.path.clone());
 
-        verify_path_exists(&search_path).await?;
-
         let include = args.include.as_deref().map(str::trim).and_then(|val| {
             if val.is_empty() {
                 None
@@ -81,6 +86,37 @@ impl ToolHandler for GrepFilesHandler {
                 Some(val.to_string())
             }
         });
+
+        if let Some((client, workspace_id)) =
+            get_remote_workspace_binding(session.as_ref(), turn.as_ref())?
+        {
+            let response = client
+                .grep_files(RemoteGrepFilesRequest {
+                    workspace_id: workspace_id.to_string(),
+                    pattern: pattern.to_string(),
+                    include,
+                    path: Some(search_path.to_string_lossy().into_owned()),
+                    limit,
+                })
+                .await
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!("grep_files failed: {err}"))
+                })?;
+
+            return if response.matches.is_empty() {
+                Ok(ToolOutput::Function {
+                    body: FunctionCallOutputBody::Text("No matches found.".to_string()),
+                    success: Some(false),
+                })
+            } else {
+                Ok(ToolOutput::Function {
+                    body: FunctionCallOutputBody::Text(response.matches.join("\n")),
+                    success: Some(true),
+                })
+            };
+        }
+
+        verify_path_exists(&search_path).await?;
 
         let search_results =
             run_rg_search(pattern, include.as_deref(), &search_path, limit, &turn.cwd).await?;
@@ -96,6 +132,24 @@ impl ToolHandler for GrepFilesHandler {
                 success: Some(true),
             })
         }
+    }
+}
+
+fn get_remote_workspace_binding<'a>(
+    session: &'a crate::codex::Session,
+    turn: &'a crate::codex::TurnContext,
+) -> Result<Option<(&'a std::sync::Arc<RemoteWorkspaceClient>, &'a str)>, FunctionCallError> {
+    match (
+        session.services.remote_workspace_client.as_ref(),
+        turn.remote_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.workspace_id.as_deref()),
+    ) {
+        (Some(client), Some(workspace_id)) => Ok(Some((client, workspace_id))),
+        (None, None) => Ok(None),
+        _ => Err(FunctionCallError::RespondToModel(
+            "remote workspace session is misconfigured".to_string(),
+        )),
     }
 }
 
@@ -173,8 +227,21 @@ fn parse_results(stdout: &[u8], limit: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex::make_session_and_context_with_rx;
+    use crate::remote_workspace::RemoteWorkspaceClient;
+    use crate::remote_workspace::RemoteWorkspaceConfig;
+    use crate::remote_workspace::RemoteWorkspaceSession;
+    use crate::tools::context::ToolInvocation;
+    use crate::tools::context::ToolOutput;
+    use crate::tools::context::ToolPayload;
+    use crate::turn_diff_tracker::TurnDiffTracker;
     use std::process::Command as StdCommand;
+    use std::sync::Arc;
     use tempfile::tempdir;
+    use tokio::sync::Mutex;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn parses_basic_results() {
@@ -266,5 +333,65 @@ mod tests {
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false)
+    }
+
+    fn output_text(output: ToolOutput) -> String {
+        match output {
+            ToolOutput::Function { body, .. } => body.to_text().unwrap_or_default(),
+            ToolOutput::Mcp { .. } => panic!("expected function output"),
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_files_handler_uses_remote_workspace_when_bound() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/workspaces/ws_grep/grep_files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "matches": ["/workspace/repo/src/lib.rs"]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = RemoteWorkspaceConfig {
+            enabled: true,
+            base_url: Some(server.uri()),
+            ..Default::default()
+        };
+        let client = RemoteWorkspaceClient::from_config(&config)?
+            .expect("enabled remote workspace should create a client");
+
+        let (mut session, mut turn, _rx) = make_session_and_context_with_rx().await;
+        Arc::get_mut(&mut session)
+            .expect("session is uniquely owned")
+            .services
+            .remote_workspace_client = Some(Arc::new(client));
+        Arc::get_mut(&mut turn)
+            .expect("turn is uniquely owned")
+            .remote_workspace = Some(RemoteWorkspaceSession {
+            config: config.clone(),
+            workspace_id: Some("ws_grep".to_string()),
+        });
+
+        let output = GrepFilesHandler
+            .handle(ToolInvocation {
+                session,
+                turn,
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: "call_grep".to_string(),
+                tool_name: "grep_files".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({
+                        "pattern": "alpha",
+                        "path": "/workspace/repo",
+                        "limit": 10
+                    })
+                    .to_string(),
+                },
+            })
+            .await?;
+
+        assert_eq!(output_text(output), "/workspace/repo/src/lib.rs");
+        Ok(())
     }
 }
