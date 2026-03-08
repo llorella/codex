@@ -7,6 +7,9 @@ use codex_utils_string::take_bytes_at_char_boundary;
 use serde::Deserialize;
 
 use crate::function_tool::FunctionCallError;
+use crate::remote_workspace::RemoteReadFileIndentationRequest;
+use crate::remote_workspace::RemoteReadFileRequest;
+use crate::remote_workspace::RemoteWorkspaceClient;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -99,7 +102,12 @@ impl ToolHandler for ReadFileHandler {
     }
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
-        let ToolInvocation { payload, .. } = invocation;
+        let ToolInvocation {
+            payload,
+            session,
+            turn,
+            ..
+        } = invocation;
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -139,6 +147,42 @@ impl ToolHandler for ReadFileHandler {
             ));
         }
 
+        if let Some((client, workspace_id)) =
+            get_remote_workspace_binding(session.as_ref(), turn.as_ref())?
+        {
+            let indentation_request =
+                indentation
+                    .clone()
+                    .map(|indentation| RemoteReadFileIndentationRequest {
+                        anchor_line: indentation.anchor_line,
+                        max_levels: indentation.max_levels,
+                        include_siblings: indentation.include_siblings,
+                        include_header: indentation.include_header,
+                        max_lines: indentation.max_lines,
+                    });
+            let response = client
+                .read_file(RemoteReadFileRequest {
+                    workspace_id: workspace_id.to_string(),
+                    file_path,
+                    offset,
+                    limit,
+                    mode: match mode {
+                        ReadMode::Slice => "slice".to_string(),
+                        ReadMode::Indentation => "indentation".to_string(),
+                    },
+                    indentation: indentation_request,
+                })
+                .await
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!("read_file failed: {err}"))
+                })?;
+
+            return Ok(ToolOutput::Function {
+                body: FunctionCallOutputBody::Text(response.lines.join("\n")),
+                success: Some(true),
+            });
+        }
+
         let collected = match mode {
             ReadMode::Slice => slice::read(&path, offset, limit).await?,
             ReadMode::Indentation => {
@@ -150,6 +194,24 @@ impl ToolHandler for ReadFileHandler {
             body: FunctionCallOutputBody::Text(collected.join("\n")),
             success: Some(true),
         })
+    }
+}
+
+fn get_remote_workspace_binding<'a>(
+    session: &'a crate::codex::Session,
+    turn: &'a crate::codex::TurnContext,
+) -> Result<Option<(&'a std::sync::Arc<RemoteWorkspaceClient>, &'a str)>, FunctionCallError> {
+    match (
+        session.services.remote_workspace_client.as_ref(),
+        turn.remote_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.workspace_id.as_deref()),
+    ) {
+        (Some(client), Some(workspace_id)) => Ok(Some((client, workspace_id))),
+        (None, None) => Ok(None),
+        _ => Err(FunctionCallError::RespondToModel(
+            "remote workspace session is misconfigured".to_string(),
+        )),
     }
 }
 
@@ -488,8 +550,21 @@ mod tests {
     use super::indentation::read_block;
     use super::slice::read;
     use super::*;
+    use crate::codex::make_session_and_context_with_rx;
+    use crate::remote_workspace::RemoteWorkspaceClient;
+    use crate::remote_workspace::RemoteWorkspaceConfig;
+    use crate::remote_workspace::RemoteWorkspaceSession;
+    use crate::tools::context::ToolInvocation;
+    use crate::tools::context::ToolOutput;
+    use crate::tools::context::ToolPayload;
+    use crate::turn_diff_tracker::TurnDiffTracker;
     use pretty_assertions::assert_eq;
+    use std::sync::Arc;
     use tempfile::NamedTempFile;
+    use tokio::sync::Mutex;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
     async fn reads_requested_range() -> anyhow::Result<()> {
@@ -986,6 +1061,67 @@ private:
                 "L23:     }".to_string(),
             ]
         );
+        Ok(())
+    }
+
+    fn output_text(output: ToolOutput) -> String {
+        match output {
+            ToolOutput::Function { body, .. } => body.to_text().unwrap_or_default(),
+            ToolOutput::Mcp { .. } => panic!("expected function output"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_file_handler_uses_remote_workspace_when_bound() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/workspaces/ws_read/read_file"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "lines": ["L1: remote contents"]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = RemoteWorkspaceConfig {
+            enabled: true,
+            base_url: Some(server.uri()),
+            ..Default::default()
+        };
+        let client = RemoteWorkspaceClient::from_config(&config)?
+            .expect("enabled remote workspace should create a client");
+
+        let (mut session, mut turn, _rx) = make_session_and_context_with_rx().await;
+        Arc::get_mut(&mut session)
+            .expect("session is uniquely owned")
+            .services
+            .remote_workspace_client = Some(Arc::new(client));
+        Arc::get_mut(&mut turn)
+            .expect("turn is uniquely owned")
+            .remote_workspace = Some(RemoteWorkspaceSession {
+            config: config.clone(),
+            workspace_id: Some("ws_read".to_string()),
+        });
+
+        let file_path = turn.cwd.join("missing_remote.txt");
+        let output = ReadFileHandler
+            .handle(ToolInvocation {
+                session,
+                turn,
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: "call_read".to_string(),
+                tool_name: "read_file".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({
+                        "file_path": file_path,
+                        "offset": 1,
+                        "limit": 10
+                    })
+                    .to_string(),
+                },
+            })
+            .await?;
+
+        assert_eq!(output_text(output), "L1: remote contents");
         Ok(())
     }
 }

@@ -11,6 +11,8 @@ use serde::Deserialize;
 use tokio::fs;
 
 use crate::function_tool::FunctionCallError;
+use crate::remote_workspace::RemoteListDirRequest;
+use crate::remote_workspace::RemoteWorkspaceClient;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -53,7 +55,12 @@ impl ToolHandler for ListDirHandler {
     }
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
-        let ToolInvocation { payload, .. } = invocation;
+        let ToolInvocation {
+            payload,
+            session,
+            turn,
+            ..
+        } = invocation;
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -98,6 +105,31 @@ impl ToolHandler for ListDirHandler {
             ));
         }
 
+        if let Some((client, workspace_id)) =
+            get_remote_workspace_binding(session.as_ref(), turn.as_ref())?
+        {
+            let response = client
+                .list_dir(RemoteListDirRequest {
+                    workspace_id: workspace_id.to_string(),
+                    dir_path,
+                    offset,
+                    limit,
+                    depth,
+                })
+                .await
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!("list_dir failed: {err}"))
+                })?;
+
+            let mut output = Vec::with_capacity(response.entries.len() + 1);
+            output.push(format!("Absolute path: {}", response.absolute_path));
+            output.extend(response.entries);
+            return Ok(ToolOutput::Function {
+                body: FunctionCallOutputBody::Text(output.join("\n")),
+                success: Some(true),
+            });
+        }
+
         let entries = list_dir_slice(&path, offset, limit, depth).await?;
         let mut output = Vec::with_capacity(entries.len() + 1);
         output.push(format!("Absolute path: {}", path.display()));
@@ -106,6 +138,24 @@ impl ToolHandler for ListDirHandler {
             body: FunctionCallOutputBody::Text(output.join("\n")),
             success: Some(true),
         })
+    }
+}
+
+fn get_remote_workspace_binding<'a>(
+    session: &'a crate::codex::Session,
+    turn: &'a crate::codex::TurnContext,
+) -> Result<Option<(&'a std::sync::Arc<RemoteWorkspaceClient>, &'a str)>, FunctionCallError> {
+    match (
+        session.services.remote_workspace_client.as_ref(),
+        turn.remote_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.workspace_id.as_deref()),
+    ) {
+        (Some(client), Some(workspace_id)) => Ok(Some((client, workspace_id))),
+        (None, None) => Ok(None),
+        _ => Err(FunctionCallError::RespondToModel(
+            "remote workspace session is misconfigured".to_string(),
+        )),
     }
 }
 
@@ -271,8 +321,21 @@ impl From<&FileType> for DirEntryKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex::make_session_and_context_with_rx;
+    use crate::remote_workspace::RemoteWorkspaceClient;
+    use crate::remote_workspace::RemoteWorkspaceConfig;
+    use crate::remote_workspace::RemoteWorkspaceSession;
+    use crate::tools::context::ToolInvocation;
+    use crate::tools::context::ToolOutput;
+    use crate::tools::context::ToolPayload;
+    use crate::turn_diff_tracker::TurnDiffTracker;
     use pretty_assertions::assert_eq;
+    use std::sync::Arc;
     use tempfile::tempdir;
+    use tokio::sync::Mutex;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
     async fn lists_directory_entries() {
@@ -509,6 +572,72 @@ mod tests {
             ]
         );
 
+        Ok(())
+    }
+
+    fn output_text(output: ToolOutput) -> String {
+        match output {
+            ToolOutput::Function { body, .. } => body.to_text().unwrap_or_default(),
+            ToolOutput::Mcp { .. } => panic!("expected function output"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_dir_handler_uses_remote_workspace_when_bound() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/workspaces/ws_dir/list_dir"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "absolute_path": "/workspace/repo",
+                "entries": ["src/", "README.md"]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = RemoteWorkspaceConfig {
+            enabled: true,
+            base_url: Some(server.uri()),
+            ..Default::default()
+        };
+        let client = RemoteWorkspaceClient::from_config(&config)?
+            .expect("enabled remote workspace should create a client");
+
+        let (mut session, mut turn, _rx) = make_session_and_context_with_rx().await;
+        Arc::get_mut(&mut session)
+            .expect("session is uniquely owned")
+            .services
+            .remote_workspace_client = Some(Arc::new(client));
+        Arc::get_mut(&mut turn)
+            .expect("turn is uniquely owned")
+            .remote_workspace = Some(RemoteWorkspaceSession {
+            config: config.clone(),
+            workspace_id: Some("ws_dir".to_string()),
+        });
+
+        let dir_path = turn.cwd.join("missing_remote_dir");
+        let output = ListDirHandler
+            .handle(ToolInvocation {
+                session,
+                turn,
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: "call_list".to_string(),
+                tool_name: "list_dir".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({
+                        "dir_path": dir_path,
+                        "offset": 1,
+                        "limit": 10,
+                        "depth": 2
+                    })
+                    .to_string(),
+                },
+            })
+            .await?;
+
+        assert_eq!(
+            output_text(output),
+            "Absolute path: /workspace/repo\nsrc/\nREADME.md"
+        );
         Ok(())
     }
 }

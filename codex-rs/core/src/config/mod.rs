@@ -54,6 +54,7 @@ use crate::project_doc::LOCAL_PROJECT_DOC_FILENAME;
 use crate::protocol::AskForApproval;
 use crate::protocol::ReadOnlyAccess;
 use crate::protocol::SandboxPolicy;
+use crate::remote_workspace::RemoteWorkspaceConfig;
 use crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
@@ -324,6 +325,9 @@ pub struct Config {
     /// for the session. All relative paths inside the business-logic layer are
     /// resolved against this path.
     pub cwd: PathBuf,
+
+    /// Optional configuration for a remote-authoritative workspace session.
+    pub remote_workspace: Option<RemoteWorkspaceConfig>,
 
     /// Preferred store for CLI auth credentials.
     /// file (default): Use a file in the Codex home directory.
@@ -1066,6 +1070,9 @@ pub struct ConfigToml {
 
     /// Sandbox configuration to apply if `sandbox` is `WorkspaceWrite`.
     pub sandbox_workspace_write: Option<SandboxWorkspaceWrite>,
+
+    /// Optional configuration for using a remote-authoritative workspace.
+    pub remote_workspace: Option<RemoteWorkspaceConfig>,
 
     /// Default named permissions profile to apply from the `[permissions]`
     /// table.
@@ -2348,6 +2355,10 @@ impl Config {
             model_provider_id,
             model_provider,
             cwd: resolved_cwd,
+            remote_workspace: cfg
+                .remote_workspace
+                .clone()
+                .filter(|config| config.is_enabled()),
             startup_warnings,
             permissions: Permissions {
                 approval_policy: constrained_approval_policy.value,

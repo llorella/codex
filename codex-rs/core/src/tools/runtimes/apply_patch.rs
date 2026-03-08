@@ -5,9 +5,12 @@
 //! `codex --codex-run-as-apply-patch`, and runs under the current
 //! `SandboxAttempt` with a minimal environment.
 use crate::exec::ExecToolCallOutput;
+use crate::exec::StreamOutput;
 use crate::guardian::GuardianReviewRequest;
 use crate::guardian::review_approval_request;
 use crate::guardian::routes_approval_to_guardian;
+use crate::remote_workspace::RemoteApplyPatchRequest;
+use crate::remote_workspace::RemoteWorkspaceClient;
 use crate::sandboxing::CommandSpec;
 use crate::sandboxing::SandboxPermissions;
 use crate::sandboxing::execute_env;
@@ -189,6 +192,27 @@ impl ToolRuntime<ApplyPatchRequest, ExecToolCallOutput> for ApplyPatchRuntime {
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<ExecToolCallOutput, ToolError> {
+        if let Some((client, workspace_id)) =
+            get_remote_workspace_binding(ctx.session.as_ref(), ctx.turn.as_ref())?
+        {
+            let response = client
+                .apply_patch(RemoteApplyPatchRequest {
+                    workspace_id: workspace_id.to_string(),
+                    patch: req.action.patch.clone(),
+                })
+                .await
+                .map_err(|err| ToolError::Rejected(format!("remote apply_patch failed: {err}")))?;
+            let aggregated_output = format!("{}{}", response.stdout, response.stderr);
+            return Ok(ExecToolCallOutput {
+                exit_code: response.exit_code,
+                stdout: StreamOutput::new(response.stdout),
+                stderr: StreamOutput::new(response.stderr),
+                aggregated_output: StreamOutput::new(aggregated_output),
+                duration: response.wall_time,
+                timed_out: false,
+            });
+        }
+
         let spec = Self::build_command_spec(req, &ctx.turn.config.codex_home)?;
         let env = attempt
             .env_for(spec, None)
@@ -200,12 +224,39 @@ impl ToolRuntime<ApplyPatchRequest, ExecToolCallOutput> for ApplyPatchRuntime {
     }
 }
 
+fn get_remote_workspace_binding<'a>(
+    session: &'a crate::codex::Session,
+    turn: &'a crate::codex::TurnContext,
+) -> Result<Option<(&'a std::sync::Arc<RemoteWorkspaceClient>, &'a str)>, ToolError> {
+    match (
+        session.services.remote_workspace_client.as_ref(),
+        turn.remote_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.workspace_id.as_deref()),
+    ) {
+        (Some(client), Some(workspace_id)) => Ok(Some((client, workspace_id))),
+        (None, None) => Ok(None),
+        _ => Err(ToolError::Rejected(
+            "remote workspace session is misconfigured".to_string(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex::make_session_and_context_with_rx;
+    use crate::remote_workspace::RemoteWorkspaceClient;
+    use crate::remote_workspace::RemoteWorkspaceConfig;
+    use crate::remote_workspace::RemoteWorkspaceSession;
+    use crate::sandboxing::SandboxManager;
     use codex_protocol::protocol::RejectConfig;
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn wants_no_sandbox_approval_reject_respects_sandbox_flag() {
@@ -266,5 +317,91 @@ mod tests {
                 }),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_uses_remote_workspace_when_bound() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/workspaces/ws_patch/apply_patch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "stdout": "applied",
+                "stderr": "",
+                "exit_code": 0,
+                "wall_time_ms": 7
+            })))
+            .mount(&server)
+            .await;
+
+        let config = RemoteWorkspaceConfig {
+            enabled: true,
+            base_url: Some(server.uri()),
+            ..Default::default()
+        };
+        let client = RemoteWorkspaceClient::from_config(&config)?
+            .expect("enabled remote workspace should create a client");
+
+        let (mut session, mut turn, _rx) = make_session_and_context_with_rx().await;
+        Arc::get_mut(&mut session)
+            .expect("session is uniquely owned")
+            .services
+            .remote_workspace_client = Some(Arc::new(client));
+        Arc::get_mut(&mut turn)
+            .expect("turn is uniquely owned")
+            .remote_workspace = Some(RemoteWorkspaceSession {
+            config: config.clone(),
+            workspace_id: Some("ws_patch".to_string()),
+        });
+
+        let path = turn.cwd.join("note.txt");
+        let action = ApplyPatchAction::new_add_for_test(&path, "hello".to_string());
+        let req = ApplyPatchRequest {
+            action,
+            file_paths: vec![
+                AbsolutePathBuf::from_absolute_path(&path).expect("temp path should be absolute"),
+            ],
+            changes: HashMap::from([(
+                path,
+                FileChange::Add {
+                    content: "hello".to_string(),
+                },
+            )]),
+            exec_approval_requirement: ExecApprovalRequirement::Skip {
+                bypass_sandbox: false,
+                proposed_execpolicy_amendment: None,
+            },
+            timeout_ms: None,
+            codex_exe: None,
+        };
+
+        let manager = SandboxManager::new();
+        let attempt = SandboxAttempt {
+            sandbox: crate::exec::SandboxType::None,
+            policy: &turn.sandbox_policy,
+            file_system_policy: &turn.file_system_sandbox_policy,
+            network_policy: turn.network_sandbox_policy,
+            enforce_managed_network: false,
+            manager: &manager,
+            sandbox_cwd: &turn.cwd,
+            codex_linux_sandbox_exe: turn.codex_linux_sandbox_exe.as_ref(),
+            use_linux_sandbox_bwrap: false,
+            windows_sandbox_level: turn.windows_sandbox_level,
+        };
+        let tool_ctx = ToolCtx {
+            session: session.clone(),
+            turn: turn.clone(),
+            call_id: "call_patch".to_string(),
+            tool_name: "apply_patch".to_string(),
+        };
+
+        let output = ApplyPatchRuntime::new()
+            .run(&req, &attempt, &tool_ctx)
+            .await
+            .expect("remote apply_patch should succeed");
+
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout.text, "applied");
+        assert_eq!(output.duration, std::time::Duration::from_millis(7));
+        Ok(())
     }
 }

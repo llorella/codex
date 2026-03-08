@@ -13,6 +13,8 @@ use crate::mcp::McpManager;
 use crate::mcp_connection_manager::McpConnectionManager;
 use crate::models_manager::manager::ModelsManager;
 use crate::plugins::PluginsManager;
+use crate::remote_workspace::RemoteUnifiedExecSessionState;
+use crate::remote_workspace::RemoteWorkspaceClient;
 use crate::skills::SkillsManager;
 use crate::state_db::StateDbHandle;
 use crate::tools::network_approval::NetworkApprovalService;
@@ -57,6 +59,8 @@ pub(crate) struct SessionServices {
     pub(crate) network_proxy: Option<StartedNetworkProxy>,
     pub(crate) network_approval: Arc<NetworkApprovalService>,
     pub(crate) state_db: Option<StateDbHandle>,
+    pub(crate) remote_workspace_client: Option<Arc<RemoteWorkspaceClient>>,
+    pub(crate) remote_unified_exec_sessions: Mutex<HashMap<String, RemoteUnifiedExecSessionState>>,
     /// Session-scoped model client shared across turns.
     pub(crate) model_client: ModelClient,
 }

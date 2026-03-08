@@ -56,6 +56,7 @@ pub(crate) struct ToolsConfig {
     pub shell_type: ConfigShellToolType,
     shell_command_backend: ShellCommandBackendConfig,
     pub unified_exec_backend: UnifiedExecBackendConfig,
+    pub remote_workspace_enabled: bool,
     pub allow_login_shell: bool,
     pub apply_patch_tool_type: Option<ApplyPatchToolType>,
     pub web_search_mode: Option<WebSearchMode>,
@@ -157,6 +158,7 @@ impl ToolsConfig {
             shell_type,
             shell_command_backend,
             unified_exec_backend,
+            remote_workspace_enabled: false,
             allow_login_shell: true,
             apply_patch_tool_type,
             web_search_mode: *web_search_mode,
@@ -185,6 +187,14 @@ impl ToolsConfig {
 
     pub fn with_allow_login_shell(mut self, allow_login_shell: bool) -> Self {
         self.allow_login_shell = allow_login_shell;
+        self
+    }
+
+    pub fn with_remote_workspace_enabled(mut self, remote_workspace_enabled: bool) -> Self {
+        self.remote_workspace_enabled = remote_workspace_enabled;
+        if remote_workspace_enabled && self.shell_type != ConfigShellToolType::Disabled {
+            self.shell_type = ConfigShellToolType::UnifiedExec;
+        }
         self
     }
 
@@ -1878,7 +1888,7 @@ pub(crate) fn build_specs(
         }
     }
 
-    if config.shell_type != ConfigShellToolType::Disabled {
+    if config.shell_type != ConfigShellToolType::Disabled && !config.remote_workspace_enabled {
         // Always register shell aliases so older prompts remain compatible.
         builder.register_handler("shell", shell_handler.clone());
         builder.register_handler("container.exec", shell_handler.clone());
@@ -1959,9 +1969,10 @@ pub(crate) fn build_specs(
         builder.register_handler("list_dir", list_dir_handler);
     }
 
-    if config
-        .experimental_supported_tools
-        .contains(&"test_sync_tool".to_string())
+    if !config.remote_workspace_enabled
+        && config
+            .experimental_supported_tools
+            .contains(&"test_sync_tool".to_string())
     {
         let test_sync_handler = Arc::new(TestSyncHandler);
         builder.push_spec_with_parallel_support(create_test_sync_tool(), true);
@@ -2335,6 +2346,40 @@ mod tests {
                 "spawn_agents_on_csv",
             ],
         );
+    }
+
+    #[test]
+    fn test_build_specs_remote_workspace_forces_exec_and_suppresses_local_shell_aliases() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let features = Features::with_defaults();
+        let mut tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+            session_source: SessionSource::Cli,
+        })
+        .with_remote_workspace_enabled(true);
+        tools_config
+            .experimental_supported_tools
+            .push("test_sync_tool".to_string());
+
+        let (tools, registry) = build_specs(&tools_config, None, None, &[]).build();
+
+        assert_contains_tool_names(&tools, &["exec_command", "write_stdin"]);
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool_name(&tool.spec) != "test_sync_tool"),
+            "remote mode should not expose local-only sync test tools"
+        );
+        assert!(registry.handler("exec_command").is_some());
+        assert!(registry.handler("write_stdin").is_some());
+        assert!(registry.handler("shell").is_none());
+        assert!(registry.handler("container.exec").is_none());
+        assert!(registry.handler("local_shell").is_none());
+        assert!(registry.handler("shell_command").is_none());
     }
 
     #[test]
